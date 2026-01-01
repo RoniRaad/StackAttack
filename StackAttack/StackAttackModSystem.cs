@@ -7,6 +7,8 @@ using Vintagestory.API.Server;
 using Vintagestory.API.MathTools;
 using StackAttack.assets;
 using Vintagestory.GameContent;
+using StackAttack.Configuration;
+using System;
 
 namespace StackAttack
 {
@@ -17,20 +19,64 @@ namespace StackAttack
 
         readonly string CHANNEL_NAME = "stackattack";
 
+        public static Config config { get; set; }
+
+        private void TryToLoadConfig(ICoreAPI api)
+        {
+            string configFileName = "StackAttackConfig.json";
+            try
+            {
+                config = api.LoadModConfig<Config>(configFileName);
+                if (config == null)
+                {
+                    config = new Config();
+                }
+
+                api.StoreModConfig<Config>(config, configFileName);
+            }
+            catch (Exception e)
+            {
+                Mod.Logger.Error("Could not load config! Loading default settings instead.");
+                Mod.Logger.Error(e);
+                config = new Config();
+            }
+        }
+
+        public override void StartPre(ICoreAPI api)
+        {
+            base.StartPre(api);
+            TryToLoadConfig(api);
+        }
+
         public override void Start(ICoreAPI api)
         {
             base.Start(api);
             api.Network.RegisterChannel(CHANNEL_NAME).RegisterMessageType<QuickStackPacket>();
+            api.World.Logger.Event("Mod '{0}' started", Mod.Info.Name);
         }
 
         private void RegisterHotKeys(ICoreClientAPI api)
         {
-            api.Input.RegisterHotKey("quickstack", "Quick Stack", GlKeys.V, HotkeyType.InventoryHotkeys);
-            api.Input.SetHotKeyHandler("quickstack", QuickStackHotkey);
-            api.Input.RegisterHotKey("depositall", "Deposit All", GlKeys.B, HotkeyType.InventoryHotkeys);
-            api.Input.SetHotKeyHandler("depositall", DepositAllHotkey);
-            api.Input.RegisterHotKey("withdrawall", "Withdraw All", GlKeys.B, HotkeyType.InventoryHotkeys, false, false, true);
-            api.Input.SetHotKeyHandler("withdrawall", WithdrawAllHotkey);
+            if(config.EnableQuickStackHotkey)
+            {
+                api.Input.RegisterHotKey("quickstack", "Quick Stack", GlKeys.V, HotkeyType.InventoryHotkeys);
+                api.Input.SetHotKeyHandler("quickstack", QuickStackHotkey);
+            }
+            if(config.EnableDepositAllHotkey)
+            {
+                api.Input.RegisterHotKey("depositall", "Deposit All", GlKeys.B, HotkeyType.InventoryHotkeys);
+                api.Input.SetHotKeyHandler("depositall", DepositAllHotkey);
+            }
+            if(config.EnableWithdrawAllHotkey)
+            {
+                api.Input.RegisterHotKey("withdrawall", "Withdraw All", GlKeys.B, HotkeyType.InventoryHotkeys, false, false, true);
+                api.Input.SetHotKeyHandler("withdrawall", WithdrawAllHotkey);
+            }
+            if(config.EnableQuickStackNearbyHotkey)
+            {
+                api.Input.RegisterHotKey("quickstacknearby", "Quick Stack to Nearby Chests", GlKeys.N, HotkeyType.CharacterControls);
+                api.Input.SetHotKeyHandler("quickstacknearby", QuickStackNearbyHotkey);
+            }
         }
 
         IClientNetworkChannel clientChannel;
@@ -50,15 +96,67 @@ namespace StackAttack
             serverChannel = api.Network.GetChannel(CHANNEL_NAME).SetMessageHandler<QuickStackPacket>(new NetworkClientMessageHandler<QuickStackPacket>(this.OnStackAttackPacketRecieved));
         }
 
+        private List<BlockPos> GetNearbyStorageContainers(IServerPlayer player, int radius)
+        {
+            if(sapi == null)
+            {
+                throw new InvalidOperationException("GetNearbyStorageContainers should be called from server side only.");
+            }
+            IBlockAccessor blockAccessor = sapi.World.BlockAccessor;
+            BlockPos minPos = player.Entity.Pos.XYZ.AsBlockPos.AddCopy(-radius, -radius, -radius);
+            BlockPos maxPos = player.Entity.Pos.XYZ.AsBlockPos.AddCopy(radius, radius, radius);
+            List<BlockPos> containerPos = new List<BlockPos>();
+            blockAccessor.SearchBlocks(minPos, maxPos, (block, pos) =>
+            {
+                var be = blockAccessor.GetBlockEntity(pos);
+                if(be is BlockEntityGenericTypedContainer container && container.Inventory != null)
+                {
+                    containerPos.Add(pos.Copy());
+                    sapi.Logger.Debug(
+                        "[StackAttack] Found container at {0}: {1} (Type: {2}, Slots: {3})", 
+                        pos, 
+                        block.Code?.ToString() ?? "Unknown",
+                        be.GetType().Name,
+                        container.Inventory.Count
+                    );
+                }
+                return true;
+            });
+            sapi.Logger.Debug(
+                "[StackAttack] Player {0} found {1} nearby containers within radius {2}", 
+                player.PlayerName,
+                containerPos.Count,
+                radius
+            );
+            
+            return containerPos;
+        }
+
         private void OnStackAttackPacketRecieved(IServerPlayer fromPlayer, QuickStackPacket packet)
         {
+            List<BlockPos> chestPositions;
+            if(packet.MessageType == StackAttackMessageType.QuickStackNearby)
+            {
+                chestPositions = GetNearbyStorageContainers(fromPlayer, config.QuickStackNearbyRadius);
+            } else
+            {
+                chestPositions = packet.ChestPositions;
+            }
+
             InventoryBase playerInv = fromPlayer.InventoryManager.GetOwnInventory(GlobalConstants.backpackInvClassName) as InventoryBase;
             if (playerInv == null)
             {
                 sapi.Logger.Error("Player inventory is null, HOW?");
+                return;
             }
-            foreach (var chestPos in packet.ChestPositions)
+            foreach (var chestPos in chestPositions)
             {
+                if(CanPlayerAccessChest(fromPlayer, chestPos) == false)
+                {
+                    sapi.Logger.Debug("Player {0} cannot access chest at {1}", fromPlayer.PlayerName, chestPos);
+                    continue;
+                }
+
                 var chestBlock = sapi.World.BlockAccessor.GetBlockEntity(chestPos) as BlockEntityGenericTypedContainer;
                 if (chestBlock == null)
                 {
@@ -70,6 +168,7 @@ namespace StackAttack
                 switch(packet.MessageType)
                 {
                     case StackAttackMessageType.QuickStack:
+                    case StackAttackMessageType.QuickStackNearby:
                         PerformQuickStack(playerInv, chestInv, false);
                         break;
                     case StackAttackMessageType.DepositAll:
@@ -140,6 +239,23 @@ namespace StackAttack
             }
         }
 
+        private bool CanPlayerAccessChest(IServerPlayer player, BlockPos containerPos)
+        {
+            if (player.Entity.Pos.AsBlockPos.DistanceTo(containerPos) > config.QuickStackNearbyRadius)
+            {
+                return false;
+            }
+            
+            var be = sapi.World.BlockAccessor.GetBlockEntity(containerPos);
+            EnumWorldAccessResponse landClaim = sapi.World.Claims.TestAccess(player, containerPos, EnumBlockAccessFlags.Use);
+            if(landClaim != EnumWorldAccessResponse.Granted)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
         private bool ItemStackMatches(ItemSlot from, ItemSlot to)
         {
             if (from == null) return false;
@@ -154,10 +270,10 @@ namespace StackAttack
             HashSet<CollectibleObject> chestCollectibles = new HashSet<CollectibleObject>();
             if(!moveAll)
             {
-                chestCollectibles = toInv
-                    .Where(slot => !slot.Empty)  // Filter out empty slots
-                    .Select(slot => slot.Itemstack.Collectible)  // Select the collectible types
-                    .ToHashSet();
+            chestCollectibles = toInv
+                .Where(slot => !slot.Empty)  // Filter out empty slots
+                .Select(slot => slot.Itemstack.Collectible)  // Select the collectible types
+                .ToHashSet();
             }
 
             foreach (var fromSlot in fromInv)
@@ -224,6 +340,12 @@ namespace StackAttack
         private bool WithdrawAllHotkey(KeyCombination keyComb)
         {
             ClientStackManipOperation(StackAttackMessageType.WithdrawAll);
+            return true;
+        }
+
+        private bool QuickStackNearbyHotkey(KeyCombination keyComb)
+        {
+            ClientStackManipOperation(StackAttackMessageType.QuickStackNearby);
             return true;
         }
 
